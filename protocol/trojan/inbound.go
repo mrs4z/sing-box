@@ -16,6 +16,7 @@ import (
 	"github.com/sagernet/sing-box/transport/trojan"
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing-box/common/ratelimit"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -40,14 +41,24 @@ type Inbound struct {
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
 	transport                adapter.V2RayServerTransport
+	userLimiters             map[int]*ratelimit.Limiter
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TrojanInboundOptions) (adapter.Inbound, error) {
+	// Build per-user rate limiters
+	userLimiters := make(map[int]*ratelimit.Limiter)
+	for i, user := range options.Users {
+		if user.SpeedLimit > 0 {
+			userLimiters[i] = ratelimit.NewLimiter(user.SpeedLimit)
+		}
+	}
+
 	inbound := &Inbound{
-		Adapter: inbound.NewAdapter(C.TypeTrojan, tag),
-		router:  router,
-		logger:  logger,
-		users:   options.Users,
+		Adapter:      inbound.NewAdapter(C.TypeTrojan, tag),
+		router:       router,
+		logger:       logger,
+		users:        options.Users,
+		userLimiters: userLimiters,
 	}
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
@@ -196,6 +207,21 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 		metadata.User = user
 	}
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+
+	// Apply per-user rate limiting if configured
+	if limiter, ok := h.userLimiters[userIndex]; ok {
+		destHost := metadata.Destination.Fqdn
+		allowedHosts := h.users[userIndex].AllowedHosts
+		conn = ratelimit.NewLimitedConn(conn, limiter, destHost, func(host string) bool {
+			for _, ah := range allowedHosts {
+				if host == ah {
+					return true
+				}
+			}
+			return false
+		})
+	}
+
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
