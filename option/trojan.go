@@ -11,8 +11,10 @@ type TrojanInboundOptions struct {
 }
 
 type TrojanUser struct {
-	Name     string `json:"name"`
-	Password string `json:"password"`
+	Name         string   `json:"name"`
+	Password     string   `json:"password"`
+	SpeedLimit   int      `json:"speed_limit,omitempty"`   // bytes per second, 0 = unlimited
+	AllowedHosts []string `json:"allowed_hosts,omitempty"` // bypass speed limit for these hosts
 }
 
 type TrojanOutboundOptions struct {

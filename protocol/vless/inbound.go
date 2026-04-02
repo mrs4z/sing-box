@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing-box/common/ratelimit"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -35,23 +36,33 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	ctx       context.Context
-	router    adapter.ConnectionRouterEx
-	logger    logger.ContextLogger
-	listener  *listener.Listener
-	users     []option.VLESSUser
-	service   *vless.Service[int]
-	tlsConfig tls.ServerConfig
-	transport adapter.V2RayServerTransport
+	ctx          context.Context
+	router       adapter.ConnectionRouterEx
+	logger       logger.ContextLogger
+	listener     *listener.Listener
+	users        []option.VLESSUser
+	service      *vless.Service[int]
+	tlsConfig    tls.ServerConfig
+	transport    adapter.V2RayServerTransport
+	userLimiters map[int]*ratelimit.Limiter // per-user rate limiters, keyed by user index
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
+	// Build per-user rate limiters
+	userLimiters := make(map[int]*ratelimit.Limiter)
+	for i, user := range options.Users {
+		if user.SpeedLimit > 0 {
+			userLimiters[i] = ratelimit.NewLimiter(user.SpeedLimit)
+		}
+	}
+
 	inbound := &Inbound{
-		Adapter: inbound.NewAdapter(C.TypeVLESS, tag),
-		ctx:     ctx,
-		router:  uot.NewRouter(router, logger),
-		logger:  logger,
-		users:   options.Users,
+		Adapter:      inbound.NewAdapter(C.TypeVLESS, tag),
+		ctx:          ctx,
+		router:       uot.NewRouter(router, logger),
+		logger:       logger,
+		users:        options.Users,
+		userLimiters: userLimiters,
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -179,6 +190,21 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		metadata.User = user
 	}
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+
+	// Apply per-user rate limiting if configured
+	if limiter, ok := h.userLimiters[userIndex]; ok {
+		destHost := metadata.Destination.Fqdn
+		allowedHosts := h.users[userIndex].AllowedHosts
+		conn = ratelimit.NewLimitedConn(conn, limiter, destHost, func(host string) bool {
+			for _, ah := range allowedHosts {
+				if host == ah {
+					return true
+				}
+			}
+			return false
+		})
+	}
+
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -203,6 +229,9 @@ func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	} else {
 		h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
 	}
+
+	// Note: packet connections (UDP) are not rate-limited — rate limiting TCP is sufficient
+	// for traffic enforcement since most bandwidth-heavy traffic is TCP (streams, downloads).
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 

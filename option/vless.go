@@ -9,9 +9,11 @@ type VLESSInboundOptions struct {
 }
 
 type VLESSUser struct {
-	Name string `json:"name"`
-	UUID string `json:"uuid"`
-	Flow string `json:"flow,omitempty"`
+	Name         string   `json:"name"`
+	UUID         string   `json:"uuid"`
+	Flow         string   `json:"flow,omitempty"`
+	SpeedLimit   int      `json:"speed_limit,omitempty"`   // bytes per second, 0 = unlimited
+	AllowedHosts []string `json:"allowed_hosts,omitempty"` // bypass speed limit for these hosts
 }
 
 type VLESSOutboundOptions struct {
