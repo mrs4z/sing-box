@@ -1,4 +1,4 @@
-package libbox
+package potokcore
 
 // https://github.com/golang/go/issues/46893
 // TODO: remove after `bulkBarrierPreWrite: unaligned arguments` fixed

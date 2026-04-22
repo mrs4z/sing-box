@@ -1,6 +1,6 @@
 //go:build unix
 
-package libbox
+package potokcore
 
 import (
 	"net"

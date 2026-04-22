@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"os"
 	"os/exec"
@@ -60,8 +62,9 @@ func init() {
 	if err != nil {
 		currentTag = "unknown"
 	}
-	sharedFlags = append(sharedFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -s -w -buildid=  -checklinkname=0")
-	debugFlags = append(debugFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0")
+	binarySalt := getBinarySalt("SING_BOX_APPLE_BINARY_SALT")
+	sharedFlags = append(sharedFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X github.com/sagernet/sing-box/experimental/libbox.appStoreBuildSalt="+binarySalt+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -s -w -buildid=  -checklinkname=0")
+	debugFlags = append(debugFlags, "-ldflags", "-X github.com/sagernet/sing-box/constant.Version="+currentTag+" -X github.com/sagernet/sing-box/experimental/libbox.appStoreBuildSalt="+binarySalt+" -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0")
 
 	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "badlinkname", "tfogo_checklinkname0")
 	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
@@ -69,6 +72,17 @@ func init() {
 	sharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")
 	notMemcTags = append(notMemcTags, "with_low_memory")
 	debugTags = append(debugTags, "debug")
+}
+
+func getBinarySalt(envName string) string {
+	if value := os.Getenv(envName); value != "" {
+		return value
+	}
+	var randomBytes [16]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
+		log.Fatal(E.Cause(err, "generate binary salt"))
+	}
+	return "veilify-libbox-" + hex.EncodeToString(randomBytes[:])
 }
 
 type AndroidBuildConfig struct {
@@ -201,6 +215,7 @@ func buildApple() {
 	args := []string{
 		"bind",
 		"-v",
+		"-o", getAppleFrameworkName() + ".xcframework",
 		"-target", bindTarget,
 		"-libname=box",
 		"-tags-not-macos=with_low_memory",
@@ -215,7 +230,7 @@ func buildApple() {
 		args = append(args, debugFlags...)
 	}
 
-	tags := append(sharedTags, darwinTags...)
+	tags := append(filterTags(sharedTags, "with_naive_outbound"), darwinTags...)
 	//if withTailscale {
 	//	tags = append(tags, memcTags...)
 	//}
@@ -234,12 +249,65 @@ func buildApple() {
 		log.Fatal(err)
 	}
 
+	frameworkName := getAppleFrameworkName()
+	fixAppleFrameworkInfoPlists(frameworkName)
+
 	copyPath := filepath.Join("..", "sing-box-for-apple")
 	if rw.IsDir(copyPath) {
-		targetDir := filepath.Join(copyPath, "Libbox.xcframework")
+		xcframeworkName := frameworkName + ".xcframework"
+		targetDir := filepath.Join(copyPath, xcframeworkName)
 		targetDir, _ = filepath.Abs(targetDir)
 		os.RemoveAll(targetDir)
-		os.Rename("Libbox.xcframework", targetDir)
+		os.Rename(xcframeworkName, targetDir)
 		log.Info("copied to ", targetDir)
 	}
+}
+
+func fixAppleFrameworkInfoPlists(frameworkName string) {
+	matches, err := filepath.Glob(filepath.Join(frameworkName+".xcframework", "*", frameworkName+".framework", "Versions", "A", "Resources", "Info.plist"))
+	if err != nil {
+		log.Fatal(E.Cause(err, "find framework info plists"))
+	}
+	infoPlist := appleFrameworkInfoPlist(frameworkName)
+	for _, infoPath := range matches {
+		if err := os.WriteFile(infoPath, []byte(infoPlist), 0o644); err != nil {
+			log.Fatal(E.Cause(err, "write framework info plist"))
+		}
+	}
+}
+
+func appleFrameworkInfoPlist(frameworkName string) string {
+	bundleIDName := strings.ToLower(frameworkName)
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>` + frameworkName + `</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.potokvpn.` + bundleIDName + `</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>` + frameworkName + `</string>
+	<key>CFBundlePackageType</key>
+	<string>FMWK</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>MinimumOSVersion</key>
+	<string>15.0</string>
+</dict>
+</plist>
+`
+}
+
+func getAppleFrameworkName() string {
+	if value := os.Getenv("SING_BOX_APPLE_FRAMEWORK_NAME"); value != "" {
+		return value
+	}
+	return "Potokcore"
 }

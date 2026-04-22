@@ -1,4 +1,4 @@
-package libbox
+package potokcore
 
 const (
 	CommandLog int32 = iota

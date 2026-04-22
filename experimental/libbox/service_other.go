@@ -1,6 +1,6 @@
 //go:build !windows
 
-package libbox
+package potokcore
 
 import "syscall"
 

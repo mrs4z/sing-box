@@ -1,4 +1,4 @@
-package libbox
+package potokcore
 
 import (
 	C "github.com/sagernet/sing-box/constant"

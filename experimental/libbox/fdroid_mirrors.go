@@ -1,4 +1,4 @@
-package libbox
+package potokcore
 
 type FDroidMirror struct {
 	URL     string

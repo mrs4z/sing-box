@@ -1,6 +1,6 @@
 //go:build android
 
-package libbox
+package potokcore
 
 import (
 	"archive/zip"

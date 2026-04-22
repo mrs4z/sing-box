@@ -1,6 +1,6 @@
 //go:build darwin || linux
 
-package libbox
+package potokcore
 
 import (
 	"os"

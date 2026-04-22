@@ -1,4 +1,4 @@
-package libbox
+package potokcore
 
 import (
 	tun "github.com/sagernet/sing-tun"
