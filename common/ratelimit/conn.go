@@ -9,8 +9,14 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// LimitedConn wraps a net.Conn with read/write bandwidth limiting.
-// Uses a token bucket algorithm — tokens refill every 100ms.
+// LimitedConn wraps a net.Conn with DOWNLOAD-ONLY bandwidth limiting.
+//
+// Only Write — bytes the server sends to the peer, i.e. the client's
+// download — is shaped. Read (the client's upload) flows through
+// untouched: the LTE quota and the post-cap throttle are about
+// outgoing-from-server traffic only; uploads are free.
+//
+// Uses a token bucket algorithm — see Limiter.wait for refill details.
 type LimitedConn struct {
 	net.Conn
 	limiter   *Limiter
@@ -81,13 +87,11 @@ func NewLimitedConn(conn net.Conn, limiter *Limiter, destHost string, allowedFn 
 }
 
 func (c *LimitedConn) Read(b []byte) (int, error) {
-	// Bypass limiter for whitelisted destinations
-	if c.allowedFn != nil && c.destHost != "" && c.allowedFn(c.destHost) {
-		return c.Conn.Read(b)
-	}
-
-	allowed := c.limiter.wait(len(b))
-	return c.Conn.Read(b[:allowed])
+	// Uploads (client → server) are NOT rate-limited. The product
+	// spec is "limit applies only to outgoing traffic from the server",
+	// which corresponds to LimitedConn.Write. Read passes straight
+	// through to the underlying connection.
+	return c.Conn.Read(b)
 }
 
 func (c *LimitedConn) Write(b []byte) (int, error) {
