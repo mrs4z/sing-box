@@ -4,11 +4,13 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/mux"
+	"github.com/sagernet/sing-box/common/ratelimit"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
 	C "github.com/sagernet/sing-box/constant"
@@ -18,11 +20,11 @@ import (
 	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing-box/common/ratelimit"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -32,37 +34,45 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.VLESSInboundOptions](registry, C.TypeVLESS, NewInbound)
 }
 
-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+var (
+	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
+	_ adapter.ManagedUsersInbound  = (*Inbound)(nil)
+)
+
+// userEntry holds a user's options together with its rate limiter. Entries
+// are keyed by a stable numeric ID that survives UpdateUsers calls (the same
+// UUID keeps the same ID), so connections authenticated against an older
+// user table still resolve to the right entry.
+type userEntry struct {
+	user    option.VLESSUser
+	limiter *ratelimit.Limiter
+}
 
 type Inbound struct {
 	inbound.Adapter
-	ctx          context.Context
-	router       adapter.ConnectionRouterEx
-	logger       logger.ContextLogger
-	listener     *listener.Listener
-	users        []option.VLESSUser
-	service      *vless.Service[int]
-	tlsConfig    tls.ServerConfig
-	transport    adapter.V2RayServerTransport
-	userLimiters map[int]*ratelimit.Limiter // per-user rate limiters, keyed by user index
+	ctx       context.Context
+	router    adapter.ConnectionRouterEx
+	logger    logger.ContextLogger
+	listener  *listener.Listener
+	service   *vless.Service[int]
+	tlsConfig tls.ServerConfig
+	transport adapter.V2RayServerTransport
+
+	// Hot-updatable user state — see UpdateUsers.
+	userAccess  sync.RWMutex
+	userEntries map[int]*userEntry
+	userIDByKey map[string]int // UUID → stable ID
+	nextUserID  int
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
-	// Build per-user rate limiters
-	userLimiters := make(map[int]*ratelimit.Limiter)
-	for i, user := range options.Users {
-		if user.SpeedLimit > 0 {
-			userLimiters[i] = ratelimit.NewLimiter(user.SpeedLimit)
-		}
-	}
-
 	inbound := &Inbound{
-		Adapter:      inbound.NewAdapter(C.TypeVLESS, tag),
-		ctx:          ctx,
-		router:       uot.NewRouter(router, logger),
-		logger:       logger,
-		users:        options.Users,
-		userLimiters: userLimiters,
+		Adapter:     inbound.NewAdapter(C.TypeVLESS, tag),
+		ctx:         ctx,
+		router:      uot.NewRouter(router, logger),
+		logger:      logger,
+		userEntries: make(map[int]*userEntry),
+		userIDByKey: make(map[string]int),
 	}
 	var err error
 	inbound.router, err = mux.NewRouterWithOptions(inbound.router, logger, common.PtrValueOrDefault(options.Multiplex))
@@ -70,21 +80,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	service := vless.NewService[int](logger, adapter.NewUpstreamContextHandlerEx(inbound.newConnectionEx, inbound.newPacketConnectionEx))
-	service.UpdateUsers(common.MapIndexed(inbound.users, func(index int, _ option.VLESSUser) int {
-		return index
-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
-		return it.UUID
-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
-		return it.Flow
-	}))
+	ids, uuids, flows := inbound.applyUsersLocked(options.Users)
+	service.UpdateUsers(ids, uuids, flows)
 	inbound.service = service
 	if options.TLS != nil {
 		inbound.tlsConfig, err = tls.NewServerWithOptions(tls.ServerOptions{
 			Context: ctx,
 			Logger:  logger,
 			Options: common.PtrValueOrDefault(options.TLS),
+			// Users can be hot-added at runtime (UpdateUsers) with flows
+			// unknown at construction time, so KTLS is only enabled when the
+			// initial set is non-empty and flow-free.
 			KTLSCompatible: common.PtrValueOrDefault(options.Transport).Type == "" &&
 				!common.PtrValueOrDefault(options.Multiplex).Enabled &&
+				len(options.Users) > 0 &&
 				common.All(options.Users, func(it option.VLESSUser) bool {
 					return it.Flow == ""
 				}),
@@ -107,6 +116,72 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 	})
 	return inbound, nil
+}
+
+// applyUsersLocked replaces the user table, reusing stable IDs and limiter
+// instances for users that persist (matched by UUID), and returns the
+// parallel slices for service.UpdateUsers. Caller must hold userAccess for
+// writing (or have exclusive access during construction).
+func (h *Inbound) applyUsersLocked(users []option.VLESSUser) (ids []int, uuids []string, flows []string) {
+	newEntries := make(map[int]*userEntry, len(users))
+	newIDs := make(map[string]int, len(users))
+	for _, user := range users {
+		if _, dup := newIDs[user.UUID]; dup {
+			h.logger.Warn("duplicate user UUID ignored: ", user.UUID)
+			continue
+		}
+		id, exists := h.userIDByKey[user.UUID]
+		var limiter *ratelimit.Limiter
+		if exists {
+			if old := h.userEntries[id]; old != nil {
+				limiter = old.limiter
+			}
+		} else {
+			id = h.nextUserID
+			h.nextUserID++
+		}
+		if user.SpeedLimit > 0 {
+			if limiter != nil {
+				// Reuse the limiter so already-established connections pick
+				// up the new rate live.
+				limiter.SetRate(user.SpeedLimit)
+			} else {
+				limiter = ratelimit.NewLimiter(user.SpeedLimit)
+			}
+		} else {
+			limiter = nil
+		}
+		newEntries[id] = &userEntry{user: user, limiter: limiter}
+		newIDs[user.UUID] = id
+		ids = append(ids, id)
+		uuids = append(uuids, user.UUID)
+		flows = append(flows, user.Flow)
+	}
+	h.userEntries = newEntries
+	h.userIDByKey = newIDs
+	return
+}
+
+// UpdateUsers atomically replaces the inbound's user table at runtime — no
+// restart, established connections of persisting users are untouched.
+// Removed users only lose the ability to open NEW connections; close their
+// existing ones via the Clash API connections endpoint if required.
+func (h *Inbound) UpdateUsers(users []option.VLESSUser) error {
+	h.userAccess.Lock()
+	ids, uuids, flows := h.applyUsersLocked(users)
+	h.userAccess.Unlock()
+	h.service.UpdateUsers(ids, uuids, flows)
+	h.logger.Info("hot-updated user table: ", len(ids), " users")
+	return nil
+}
+
+// UpdateUsersJSON implements adapter.ManagedUsersInbound.
+func (h *Inbound) UpdateUsersJSON(data []byte) error {
+	var users []option.VLESSUser
+	if err := json.Unmarshal(data, &users); err != nil {
+		return E.Cause(err, "decode users")
+	}
+	return h.UpdateUsers(users)
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {
@@ -183,7 +258,15 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	h.userAccess.RLock()
+	entry := h.userEntries[userIndex]
+	h.userAccess.RUnlock()
+	if entry == nil {
+		// User was removed between auth and dispatch.
+		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+		return
+	}
+	user := entry.user.Name
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {
@@ -192,10 +275,10 @@ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata a
 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
 
 	// Apply per-user rate limiting if configured
-	if limiter, ok := h.userLimiters[userIndex]; ok {
+	if entry.limiter != nil {
 		destHost := metadata.Destination.Fqdn
-		allowedHosts := h.users[userIndex].AllowedHosts
-		conn = ratelimit.NewLimitedConn(conn, limiter, destHost, func(host string) bool {
+		allowedHosts := entry.user.AllowedHosts
+		conn = ratelimit.NewLimitedConn(conn, entry.limiter, destHost, func(host string) bool {
 			for _, ah := range allowedHosts {
 				if host == ah {
 					return true
@@ -216,7 +299,14 @@ func (h *Inbound) newPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 		return
 	}
-	user := h.users[userIndex].Name
+	h.userAccess.RLock()
+	entry := h.userEntries[userIndex]
+	h.userAccess.RUnlock()
+	if entry == nil {
+		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+		return
+	}
+	user := entry.user.Name
 	if user == "" {
 		user = F.ToString(userIndex)
 	} else {

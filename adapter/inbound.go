@@ -40,6 +40,14 @@ type InboundManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
 }
 
+// ManagedUsersInbound is implemented by inbounds (VLESS, Trojan) that support
+// replacing their user table at runtime without restarting the service.
+// `data` is the JSON-encoded users array in the same shape as the inbound's
+// config `users` field.
+type ManagedUsersInbound interface {
+	UpdateUsersJSON(data []byte) error
+}
+
 type InboundContext struct {
 	Inbound     string
 	InboundType string

@@ -43,6 +43,24 @@ func NewLimiter(bytesPerSecond int) *Limiter {
 	}
 }
 
+// SetRate updates the limit in place. Live connections wrapping this limiter
+// pick up the new rate on their next Write — no reconnect required.
+// Callers must pass a positive value; to lift the limit entirely, stop
+// wrapping new connections with this limiter instead.
+func (l *Limiter) SetRate(bytesPerSecond int) {
+	if bytesPerSecond <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rate = bytesPerSecond
+	l.maxTokens = bytesPerSecond
+	if l.tokens > l.maxTokens {
+		l.tokens = l.maxTokens
+	}
+	l.lastFill = time.Now()
+}
+
 // wait blocks until n tokens are available, returns number of tokens consumed.
 func (l *Limiter) wait(n int) int {
 	for {
