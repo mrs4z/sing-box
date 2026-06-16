@@ -76,6 +76,13 @@ func (t TrackerMetadata) MarshalJSON() ([]byte, error) {
 			"host":            domain,
 			"dnsMode":         "normal",
 			"processPath":     processPath,
+			// Per-user attribution for VLESS/Trojan. Without this the agent's
+			// TrafficTracker can't map a connection back to a UUID/password,
+			// so every per-peer byte counter stays 0 and free-traffic / quota
+			// enforcement never fires (unpaid users get unlimited traffic).
+			// The user is already tracked internally (closeInboundConnections
+			// filters on it); we just never serialised it here.
+			"user": t.Metadata.User,
 		},
 		"upload":      t.Upload.Load(),
 		"download":    t.Download.Load(),
