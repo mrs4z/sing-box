@@ -27,6 +27,10 @@ var _ ServerConfigCompat = (*RealityServerConfig)(nil)
 
 type RealityServerConfig struct {
 	config *utls.RealityConfig
+	// decoyPort maps an accepted decoy domain (client SNI) to the port to dial
+	// it on. Non-empty only in multi-decoy mode; when set, ServerHandshake peeks
+	// the client SNI and steers the dial to that decoy so its cert matches.
+	decoyPort map[string]int
 }
 
 func NewRealityServer(ctx context.Context, logger log.ContextLogger, options option.InboundTLSOptions) (ServerConfig, error) {
@@ -87,7 +91,27 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 	tlsConfig.Type = N.NetworkTCP
 	tlsConfig.Dest = options.Reality.Handshake.ServerOptions.Build().String()
 
+	// Multi-decoy pool (Potok custom): accept every pool domain as a valid client
+	// SNI and remember the port to dial each on. Empty pool → single-decoy legacy.
 	tlsConfig.ServerNames = map[string]bool{options.ServerName: true}
+	var decoyPort map[string]int
+	if len(options.Reality.Decoys) > 0 {
+		decoyPort = make(map[string]int, len(options.Reality.Decoys)+1)
+		// The primary handshake domain is dialed on its configured port; pool
+		// entries are bare domains dialed on :443 (standard HTTPS decoy).
+		if options.ServerName != "" {
+			decoyPort[options.ServerName] = int(options.Reality.Handshake.ServerPort)
+		}
+		for _, domain := range options.Reality.Decoys {
+			if domain == "" {
+				continue
+			}
+			tlsConfig.ServerNames[domain] = true
+			if _, exists := decoyPort[domain]; !exists {
+				decoyPort[domain] = 443
+			}
+		}
+	}
 	privateKey, err := base64.RawURLEncoding.DecodeString(options.Reality.PrivateKey)
 	if err != nil {
 		return nil, E.Cause(err, "decode private key")
@@ -120,13 +144,19 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		return nil, err
 	}
 	tlsConfig.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Multi-decoy: ServerHandshake picked the dial target from the client's
+		// SNI and stashed it here, so the decoy we relay matches the SNI the
+		// client sent. Absent (legacy path) → dial the fixed Config.Dest addr.
+		if dest, ok := destFromContext(ctx); ok {
+			addr = dest
+		}
 		return handshakeDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
 	}
 
 	if options.ECH != nil && options.ECH.Enabled {
 		return nil, E.New("Reality is conflict with ECH")
 	}
-	var config ServerConfig = &RealityServerConfig{&tlsConfig}
+	var config ServerConfig = &RealityServerConfig{config: &tlsConfig, decoyPort: decoyPort}
 	if options.KernelTx || options.KernelRx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -178,6 +208,17 @@ func (c *RealityServerConfig) Server(conn net.Conn) (Conn, error) {
 }
 
 func (c *RealityServerConfig) ServerHandshake(ctx context.Context, conn net.Conn) (Conn, error) {
+	// Multi-decoy: peek the client's SNI and, if it's a pool member, steer the
+	// REALITY dial to that exact decoy (matching cert → masquerade preserved).
+	// Fail-open: any parse miss or non-pool SNI falls through to the fixed Dest,
+	// which is byte-identical to the upstream single-decoy path.
+	if len(c.decoyPort) > 0 {
+		sni, pc := peekClientHelloSNI(conn)
+		conn = pc
+		if port, ok := c.decoyPort[sni]; ok {
+			ctx = withDest(ctx, M.ParseSocksaddrHostPort(sni, uint16(port)).String())
+		}
+	}
 	tlsConn, err := utls.RealityServer(ctx, conn, c.config)
 	if err != nil {
 		return nil, err
@@ -187,7 +228,8 @@ func (c *RealityServerConfig) ServerHandshake(ctx context.Context, conn net.Conn
 
 func (c *RealityServerConfig) Clone() Config {
 	return &RealityServerConfig{
-		config: c.config.Clone(),
+		config:    c.config.Clone(),
+		decoyPort: c.decoyPort,
 	}
 }
 

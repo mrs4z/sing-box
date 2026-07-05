@@ -191,11 +191,19 @@ func (c *CurvePreference) UnmarshalJSON(data []byte) error {
 }
 
 type InboundRealityOptions struct {
-	Enabled           bool                           `json:"enabled,omitempty"`
-	Handshake         InboundRealityHandshakeOptions `json:"handshake,omitempty"`
-	PrivateKey        string                         `json:"private_key,omitempty"`
-	ShortID           badoption.Listable[string]     `json:"short_id,omitempty"`
-	MaxTimeDifference badoption.Duration             `json:"max_time_difference,omitempty"`
+	Enabled   bool                           `json:"enabled,omitempty"`
+	Handshake InboundRealityHandshakeOptions `json:"handshake,omitempty"`
+	// Decoys is an optional pool of extra REALITY decoy domains this inbound
+	// accepts as the client SNI. When non-empty the server dials the SPECIFIC
+	// decoy the client presented (its cert matches, so masquerade holds) instead
+	// of the single fixed Handshake.Server — so a client can carry the whole pool
+	// and, if one decoy is unreachable from the box (Akamai/RU flap), retry with
+	// the next WITHOUT a reinstall or dropped connections. Empty = legacy single
+	// decoy, byte-identical behavior. Each entry is a bare domain dialed on :443.
+	Decoys            badoption.Listable[string] `json:"decoys,omitempty"`
+	PrivateKey        string                     `json:"private_key,omitempty"`
+	ShortID           badoption.Listable[string] `json:"short_id,omitempty"`
+	MaxTimeDifference badoption.Duration         `json:"max_time_difference,omitempty"`
 }
 
 type InboundRealityHandshakeOptions struct {
