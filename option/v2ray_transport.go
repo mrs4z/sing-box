@@ -15,6 +15,7 @@ type _V2RayTransportOptions struct {
 	QUICOptions        V2RayQUICOptions        `json:"-"`
 	GRPCOptions        V2RayGRPCOptions        `json:"-"`
 	HTTPUpgradeOptions V2RayHTTPUpgradeOptions `json:"-"`
+	XHTTPOptions       V2RayXHTTPOptions       `json:"-"`
 }
 
 type V2RayTransportOptions _V2RayTransportOptions
@@ -32,6 +33,8 @@ func (o V2RayTransportOptions) MarshalJSON() ([]byte, error) {
 		v = o.GRPCOptions
 	case C.V2RayTransportTypeHTTPUpgrade:
 		v = o.HTTPUpgradeOptions
+	case C.V2RayTransportTypeXHTTP:
+		v = o.XHTTPOptions
 	case "":
 		return nil, E.New("missing transport type")
 	default:
@@ -57,6 +60,8 @@ func (o *V2RayTransportOptions) UnmarshalJSON(bytes []byte) error {
 		v = &o.GRPCOptions
 	case C.V2RayTransportTypeHTTPUpgrade:
 		v = &o.HTTPUpgradeOptions
+	case C.V2RayTransportTypeXHTTP:
+		v = &o.XHTTPOptions
 	default:
 		return E.New("unknown transport type: " + o.Type)
 	}
@@ -97,4 +102,31 @@ type V2RayHTTPUpgradeOptions struct {
 	Host    string               `json:"host,omitempty"`
 	Path    string               `json:"path,omitempty"`
 	Headers badoption.HTTPHeader `json:"headers,omitempty"`
+}
+
+// V2RayXHTTPOptions configures the XHTTP client. Field names follow Xray's
+// share-link / config vocabulary rather than sing-box's snake_case so that one
+// set of names describes both ends of the connection: our servers run Xray and
+// the backend renders both sides from the same protocol variables.
+type V2RayXHTTPOptions struct {
+	Host    string               `json:"host,omitempty"`
+	Path    string               `json:"path,omitempty"`
+	Mode    string               `json:"mode,omitempty"`
+	Headers badoption.HTTPHeader `json:"headers,omitempty"`
+	// Payload bytes per uplink request.
+	ScMaxEachPostBytes int `json:"scMaxEachPostBytes,omitempty"`
+	// Padding length range ("100-1000"); the server rejects anything outside
+	// its own range with 400.
+	XPaddingBytes string `json:"xPaddingBytes,omitempty"`
+	// "POST" (default) or "GET". GET forces the payload into headers, which is
+	// what a CDN that proxies only GET/HEAD leaves us.
+	UplinkHTTPMethod string `json:"uplinkHTTPMethod,omitempty"`
+	// "body" (default) or "header".
+	UplinkDataPlacement string `json:"uplinkDataPlacement,omitempty"`
+	// Header name prefix for a header-carried uplink (default "X-Data").
+	UplinkDataKey string `json:"uplinkDataKey,omitempty"`
+	// Base64 characters per X-Data-N header.
+	UplinkChunkSize int `json:"uplinkChunkSize,omitempty"`
+	// Uplink requests allowed in flight at once.
+	MaxConcurrentUploads int `json:"maxConcurrentUploads,omitempty"`
 }
